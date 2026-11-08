@@ -2,8 +2,8 @@
  * version.dll proxy for SA-MP Map Construction (editor.exe, 1 310 720 bytes, md5 bdde354101733b90ff2c3499dab2ddbc).
  *
  * Put this DLL next to the ORIGINAL editor.exe. Windows loads it instead of the system version.dll
- * before the editor starts; it patches the editor in memory and forwards the three version.dll
- * functions the editor imports to the real system DLL. Delete the DLL to get stock behaviour back.
+ * before the editor starts; it patches the editor in memory and forwards every version.dll
+ * function to the real system DLL. Delete the DLL to get stock behaviour back.
  *
  * Fixes:
  *  1. "You cannot use the editor while game is running" - the editor probes models\gta3.img with an
@@ -14,12 +14,17 @@
  *  3. Editor in its own folder: game dir = folder of editor.exe if it contains data\gta.dat,
  *     otherwise its parent folder. The editor's own files (gta_shapes\ cache, PrefabPics\) are
  *     built from the editor folder instead of the game folder.
+ *  4. Visible SA-MP effect objects (fire, smoke, explosions, water...): their DFFs contain only a 1 mm
+ *     triangle plus a particle 2dEffect, so the editor shows nothing. When the editor reads such a model
+ *     from an IMG (GTAINTERFACE.dll IMGExportBuffer), it gets a coloured diamond marker instead; the
+ *     colour depends on the particle name. Game files are not touched.
  *
  * If the bytes at any patch site differ from the expected ones (another editor build), nothing is patched.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
+#include "marker_dff.h"
 
 /* ---------- forwarding to the real version.dll ----------
  * Every export of the system version.dll must exist here: once this module is loaded as "version.dll",
@@ -176,6 +181,124 @@ static BYTE *build_stub(void)
     return mem;
 }
 
+/* ---------- effect objects -> marker models ---------- */
+
+#define IAT_IMGEXPORTBUFFER 0x58E994      /* editor.exe import slot for GTAINTERFACE.IMGExportBuffer */
+#define FX_MAX_RADIUS       0.005f        /* effect DFFs have a 1 mm dummy triangle */
+
+typedef void (WINAPI *IMGExportBuffer_t)(int index, void *buf);
+typedef void (WINAPI *IMGGetThisFile_t)(void *rec, int index);   /* rec: {offset, sectors, name[24]} */
+
+static IMGExportBuffer_t g_img_export;
+static IMGGetThisFile_t  g_img_getfile;
+
+static DWORD rd32(const BYTE *p) { DWORD v; memcpy(&v, p, 4); return v; }
+
+typedef struct { BOOL has_geom; float max_radius; char fx[25]; } dff_scan;
+
+/* Walks the RenderWare chunk tree in [pos, end): records geometry bounding radii and the first particle 2dEffect. */
+static void scan_chunks(const BYTE *b, DWORD pos, DWORD end, dff_scan *s, int depth)
+{
+    while (depth < 8 && pos + 12 <= end) {
+        DWORD type = rd32(b + pos), size = rd32(b + pos + 4), p = pos + 12;
+        if (size > end - p) return;
+        if (type == 0x0F && size >= 28) {                         /* Geometry: Struct header + fixed part */
+            DWORD sp = p + 12, fmt = rd32(b + sp), nt = rd32(b + sp + 4), nv = rd32(b + sp + 8);
+            DWORD flags = fmt & 0xFFFF, nuv = (fmt >> 16) & 0xFF, q;
+            if (!nuv) nuv = (flags & 0x80) ? 2 : (flags & 0x04) ? 1 : 0;
+            if (nv < 0x10000 && nt < 0x10000) {
+                q = sp + 16 + ((flags & 0x08) ? 4 * nv : 0) + 8 * nv * nuv + 8 * nt;
+                if (q + 16 <= p + size) {
+                    float r; memcpy(&r, b + q + 12, 4);
+                    if (!s->has_geom || r > s->max_radius) s->max_radius = r;
+                    s->has_geom = TRUE;
+                }
+            }
+        } else if (type == 0x253F2F8 && size >= 4 && !s->fx[0]) {  /* 2dEffect: count, then entries */
+            DWORD n = rd32(b + p), q = p + 4, i;
+            for (i = 0; i < n && q + 20 <= p + size; i++) {
+                DWORD etype = rd32(b + q + 12), dsz = rd32(b + q + 16);
+                if (etype == 1 && dsz >= 24 && q + 20 + 24 <= p + size) {   /* particle: char name[24] */
+                    memcpy(s->fx, b + q + 20, 24); s->fx[24] = 0; break;
+                }
+                if (dsz > p + size - q - 20) break;
+                q += 20 + dsz;
+            }
+        }
+        if (type == 0x10 || type == 0x1A || type == 0x0F || type == 0x03 || type == 0x0E || type == 0x14)
+            scan_chunks(b, p, p + size, s, depth + 1);
+        pos = p + size;
+    }
+}
+
+static BOOL has(const char *s, const char *sub) { return strstr(s, sub) != NULL; }
+
+/* Marker colour (R,G,B) by particle name. */
+static DWORD fx_colour(const char *name)
+{
+    char s[25]; int i;
+    for (i = 0; i < 24 && name[i]; i++) s[i] = (char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i]);
+    s[i] = 0;
+    if (has(s, "explosion") || has(s, "wallbust"))                                         return RGB(235, 40, 30);
+    if (has(s, "fire") || has(s, "flame") || has(s, "molotov") || has(s, "jetthrust") ||
+        has(s, "gunflash") || has(s, "camflash") || has(s, "shootlight"))                   return RGB(255, 130, 0);
+    if (has(s, "water") || has(s, "splash") || has(s, "bubble") || has(s, "wake") || has(s, "swim") ||
+        has(s, "boat") || has(s, "carwash") || has(s, "extinguisher"))                      return RGB(40, 150, 255);
+    if (has(s, "spark") || has(s, "glass") || has(s, "debris") || has(s, "gunshell") || has(s, "nitro") ||
+        has(s, "overheat") || has(s, "jetpack") || has(s, "petrol") || has(s, "spraycan"))  return RGB(255, 225, 0);
+    if (has(s, "blood") || has(s, "puke") || has(s, "coke"))                               return RGB(210, 0, 130);
+    if (has(s, "smoke") || has(s, "exhale") || has(s, "puff") || has(s, "cloud") || has(s, "teargas") ||
+        has(s, "vent") || has(s, "dust") || has(s, "cement") || has(s, "sand") || has(s, "dirt") ||
+        has(s, "insects") || has(s, "tree_hit"))                                            return RGB(160, 160, 160);
+    return RGB(0, 220, 110);
+}
+
+static void write_marker(BYTE *buf, DWORD colour)
+{
+    BYTE r = GetRValue(colour), g = GetGValue(colour), bl = GetBValue(colour);
+    BYTE *pre = buf + MARKER_PRELIT_OFFSET;
+    int i;
+    memcpy(buf, marker_dff, MARKER_DFF_SIZE);
+    for (i = 0; i < MARKER_VERTS; i++) {                       /* prelit RGBA with baked face shading */
+        pre[i * 4 + 0] = (BYTE)(r * marker_shade[i] / 255);
+        pre[i * 4 + 1] = (BYTE)(g * marker_shade[i] / 255);
+        pre[i * 4 + 2] = (BYTE)(bl * marker_shade[i] / 255);
+        pre[i * 4 + 3] = 255;
+    }
+    buf[MARKER_MATCOL_OFFSET + 0] = r;                          /* material colour RGBA */
+    buf[MARKER_MATCOL_OFFSET + 1] = g;
+    buf[MARKER_MATCOL_OFFSET + 2] = bl;
+    buf[MARKER_MATCOL_OFFSET + 3] = 255;
+}
+
+static void WINAPI hook_IMGExportBuffer(int index, void *buf)
+{
+    BYTE rec[32];
+    DWORD size;
+    dff_scan s;
+
+    if (!g_img_export) {
+        HMODULE gi = GetModuleHandleA("GTAINTERFACE.dll");
+        if (gi) {
+            g_img_export  = (IMGExportBuffer_t)GetProcAddress(gi, "IMGExportBuffer");
+            g_img_getfile = (IMGGetThisFile_t)GetProcAddress(gi, "IMGGetThisFile");
+        }
+        if (!g_img_export) return;
+    }
+    g_img_export(index, buf);
+    if (!g_img_getfile || !buf) return;
+
+    g_img_getfile(rec, index);
+    size = rd32(rec + 4) * 2048;                               /* the editor allocates exactly this much */
+    if (size < MARKER_DFF_SIZE || size > 0x100000) return;
+    if (rd32((BYTE *)buf) != 0x10) return;                      /* not a clump */
+
+    memset(&s, 0, sizeof s);
+    scan_chunks((const BYTE *)buf, 0, size, &s, 0);
+    if (s.fx[0] && s.has_geom && s.max_radius < FX_MAX_RADIUS)
+        write_marker((BYTE *)buf, fx_colour(s.fx));
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
@@ -198,6 +321,11 @@ static void apply_patches(void)
     *(DWORD *)(hook + 1) = (DWORD)stub - (HOOK_SITE + 5);
     memset(hook + 5, 0x90, 8);
     write_mem(VA(HOOK_SITE), hook, sizeof hook);
+
+    {
+        void *fn = (void *)hook_IMGExportBuffer;
+        write_mem(VA(IAT_IMGEXPORTBUFFER), &fn, 4);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
