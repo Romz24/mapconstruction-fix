@@ -18,6 +18,14 @@
  *     triangle plus a particle 2dEffect, so the editor shows nothing. When the editor reads such a model
  *     from an IMG (GTAINTERFACE.dll IMGExportBuffer), it gets a coloured diamond marker instead; the
  *     colour depends on the particle name. Game files are not touched.
+ *  5. The world as SA-MP has it:
+ *     - IPLs of the archives that are no streamed part of a text IPL (crack, carter, truthsfarm, barriers1/2)
+ *       are not loaded: the game loads them only when its story script asks (REQUEST_IPL), SA-MP never does.
+ *     - SAMP\SAMP.ipl is loaded: SA-MP's gta.dat (from samp.saa) adds it after the game's IPLs.
+ *     - The 74 objects SA-MP's main.scm makes as the game starts (cranes with their LODs, doors, portakabins,
+ *       the searchlights of Area 51...) are loaded as one more IPL (scm_objects_ipl.h).
+ *     - What that main.scm hides with SET_VISIBILITY_OF_CLOSEST_OBJECT_OF_TYPE (the burnt shell of the San
+ *       Fierro crack factory and its LOD) is hidden, and never exported as RemoveBuildingForPlayer.
  *
  * If the bytes at any patch site differ from the expected ones (another editor build), nothing is patched.
  */
@@ -25,6 +33,7 @@
 #include <windows.h>
 #include <string.h>
 #include "marker_dff.h"
+#include "scm_objects_ipl.h"
 
 /* ---------- forwarding to the real version.dll ----------
  * Every export of the system version.dll must exist here: once this module is loaded as "version.dll",
@@ -107,6 +116,21 @@ static const BYTE PROBE_ORIG[2]   = {0x75,0x0B};
 static const BYTE SHARE_ORIG[20]  = {0,0,0,0, 0,0,0,0, 1,0,0,0, 2,0,0,0, 3,0,0,0};
 
 static char *g_editor_dir;         /* Delphi AnsiString (nil = '') - the editor's own folder */
+static HINSTANCE g_self;
+
+/* The IPL loading of TForm1.LoadMap: the loop over the archives' IPLs not loaded yet (as a stream part of
+   a text IPL), then "Processing LOD hierarchy" */
+#define BINIPL_JNE        0x4E4882   /* jne <next> when the IPL was loaded already                       */
+#define BINIPL_NEXT       0x4E4941
+#define AFTER_IPLS        0x4E494D   /* mov edx,'Processing LOD hierarchy'                               */
+#define AFTER_IPLS_BACK   0x4E4952
+#define STR_LOD_HIERARCHY 0x4E5428
+#define FN_LOADIPL        0x4FA8AC   /* TMap.LoadIPL(Self, Kind, Path: AnsiString; Binary: Boolean)     */
+#define STR_IPL           0x4E541C   /* 'IPL'                                                             */
+#define MAP_PTR           0x578EF4   /* the map: +0x3C dynamic array of IPLs, each +8 array of instances */
+
+static const BYTE BINIPL_ORIG[6]  = {0x0F,0x85,0xB9,0x00,0x00,0x00};
+static const BYTE AFTER_ORIG[5]   = {0xBA,0x28,0x54,0x4E,0x00};
 
 /* ---------- helpers ---------- */
 
@@ -138,6 +162,8 @@ static BOOL editor_matches(void)
     if (memcmp(VA(HOOK_SITE), HOOK_ORIG, sizeof HOOK_ORIG)) return FALSE;
     if (memcmp(VA(PROBE_JNE), PROBE_ORIG, sizeof PROBE_ORIG)) return FALSE;
     if (memcmp(VA(SHARE_TABLE), SHARE_ORIG, sizeof SHARE_ORIG)) return FALSE;
+    if (memcmp(VA(BINIPL_JNE), BINIPL_ORIG, sizeof BINIPL_ORIG)) return FALSE;
+    if (memcmp(VA(AFTER_IPLS), AFTER_ORIG, sizeof AFTER_ORIG)) return FALSE;
     for (i = 0; i < sizeof g_editor_refs / sizeof g_editor_refs[0]; i++)
         if (memcmp(VA(g_editor_refs[i]), &gd, 4)) return FALSE;
     return TRUE;
@@ -299,18 +325,132 @@ static void WINAPI hook_IMGExportBuffer(int index, void *buf)
         write_marker((BYTE *)buf, fx_colour(s.fx));
 }
 
+/* ---------- the world as SA-MP has it ---------- */
+
+/* An instance of an IPL as the editor keeps it */
+#define INST_MODEL   0x04   /* int                                                                   */
+#define INST_POS     0x18   /* float x, y, z                                                         */
+#define INST_MADE    0x3A   /* byte: made in the editor (0 = of the map)                             */
+#define INST_GONE    0x3B   /* byte: 0 shown; 1 removed (exported as RemoveBuildingForPlayer, "new
+                               map" brings it back); drawing, picking and the IPL export skip any non-0 */
+#define INST_HIDDEN  2      /* ours: hidden like a removed one, neither exported nor brought back    */
+
+/* SA-MP's main.scm (R3), SET_VISIBILITY_OF_CLOSEST_OBJECT_OF_TYPE at 0xC3DE-0xC42C (again at 0xC4A8): the
+   crack factory of San Fierro whole, its burnt shell (CF_EXT_DEM_SFS) and the shell's LOD hidden */
+static const struct { int model; float x, y, z, radius; BOOL visible; } g_script_visibility[] = {
+    {11012, -2166.86f, -236.5f,  40.86f, 40.0f, TRUE},    /* CRACKFACT_SFS    */
+    {11088, -2185.49f, -215.55f, 34.31f, 40.0f, FALSE},   /* CF_EXT_DEM_SFS   */
+    {11270, -2166.86f, -236.5f,  40.86f, 40.0f, TRUE},    /* LODCRACKFACT_SFS */
+    {11282, -2185.49f, -215.55f, 34.31f, 40.0f, FALSE},   /* LODEXT_DEM_SFS   */
+};
+
+static int dyn_len(void *arr) { return arr ? ((int *)arr)[-1] : 0; }   /* Delphi dynamic array */
+
+/* The instance of the model closest to a point within a radius (3D), as the script command finds it */
+static void set_visibility_of_closest(int model, float x, float y, float z, float radius, BOOL visible)
+{
+    BYTE *map = *(BYTE **)MAP_PTR, *best = NULL;
+    BYTE **ipls;
+    float min = radius * radius;
+    int i, j;
+    if (!map) return;
+    ipls = *(BYTE ***)(map + 0x3C);
+    for (i = 0; i < dyn_len(ipls); i++) {
+        BYTE **inst = *(BYTE ***)(ipls[i] + 8);
+        for (j = 0; j < dyn_len(inst); j++) {
+            const float *p = (const float *)(inst[j] + INST_POS);
+            float dx = p[0] - x, dy = p[1] - y, dz = p[2] - z, d = dx * dx + dy * dy + dz * dz;
+            if (*(int *)(inst[j] + INST_MODEL) != model || d >= min) continue;
+            min = d;
+            best = inst[j];
+        }
+    }
+    if (!best || best[INST_MADE]) return;
+    if (!visible && !best[INST_GONE]) best[INST_GONE] = INST_HIDDEN;
+    if (visible && best[INST_GONE] == INST_HIDDEN) best[INST_GONE] = 0;
+}
+
+/* A path as a Delphi AnsiString constant (reference count -1): the editor keeps it as it is */
+typedef struct { LONG refs; LONG len; char s[MAX_PATH + 1]; } delphi_str;
+
+static void load_ipl(delphi_str *path)
+{
+    DWORD fn = FN_LOADIPL, map = *(DWORD *)MAP_PTR;
+    const char *chars = path->s;
+    path->refs = -1;
+    path->len = (LONG)strlen(path->s);
+    __asm {
+        push 0                  /* Binary := False: a text IPL from the disk */
+        mov ecx, chars
+        mov edx, STR_IPL
+        mov eax, map
+        call fn                 /* register convention, the callee takes its stack argument */
+    }
+}
+
+/* After the editor's own IPLs, before it links the LODs: SA-MP's IPL, the script's objects, what it hides */
+static void after_ipls(void)
+{
+    static delphi_str samp, scm;
+    const char *game = *(const char **)GAME_DIR;
+    char *slash;
+    HANDLE f;
+    DWORD written;
+    size_t i;
+
+    if (game) {
+        lstrcpynA(samp.s, game, MAX_PATH - 16);
+        lstrcatA(samp.s, "\\SAMP\\SAMP.ipl");
+        if (GetFileAttributesA(samp.s) != INVALID_FILE_ATTRIBUTES) load_ipl(&samp);
+    }
+
+    /* Next to this DLL (the editor's folder). The editor skips IPLs whose path has "path" in it */
+    GetModuleFileNameA(g_self, scm.s, MAX_PATH - 20);
+    slash = strrchr(scm.s, '\\');
+    if (slash) {
+        lstrcpyA(slash + 1, "samp_scm.ipl");
+        f = CreateFileA(scm.s, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            BOOL ok = WriteFile(f, scm_objects_ipl, sizeof scm_objects_ipl - 1, &written, NULL);
+            CloseHandle(f);
+            if (ok && written == sizeof scm_objects_ipl - 1) load_ipl(&scm);
+        }
+    }
+
+    for (i = 0; i < sizeof g_script_visibility / sizeof g_script_visibility[0]; i++)
+        set_visibility_of_closest(g_script_visibility[i].model, g_script_visibility[i].x, g_script_visibility[i].y,
+                                  g_script_visibility[i].z, g_script_visibility[i].radius, g_script_visibility[i].visible);
+}
+
+/* At "mov edx,'Processing LOD hierarchy'": our IPLs, then the instruction it replaced */
+static BYTE *build_after_ipls_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+    *e.p++ = 0x60;                                        /* pushad                       */
+    e_rel(&e, 0xE8, (DWORD)after_ipls);                   /* call after_ipls              */
+    *e.p++ = 0x61;                                        /* popad                        */
+    *e.p++ = 0xBA; e_u32(&e, STR_LOD_HIERARCHY);          /* mov edx,'Processing LOD...'  */
+    e_rel(&e, 0xE9, AFTER_IPLS_BACK);
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
     static const DWORD share_all[2] = {FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE};
     BYTE hook[13];
-    BYTE *stub;
+    BYTE *stub, *after;
     DWORD ed = (DWORD)&g_editor_dir;
     size_t i;
 
     if (!editor_matches()) return;
     stub = build_stub();
-    if (!stub) return;
+    after = build_after_ipls_stub();
+    if (!stub || !after) return;
 
     write_mem(VA(PROBE_JNE), probe_new, sizeof probe_new);
     write_mem(VA(SHARE_TABLE), share_all, sizeof share_all);
@@ -326,6 +466,15 @@ static void apply_patches(void)
         void *fn = (void *)hook_IMGExportBuffer;
         write_mem(VA(IAT_IMGEXPORTBUFFER), &fn, 4);
     }
+
+    {
+        BYTE skip[6] = {0xE9, 0, 0, 0, 0, 0x90};          /* jmp <next>: no IPL is left over to load */
+        BYTE jump[5] = {0xE9};
+        *(DWORD *)(skip + 1) = BINIPL_NEXT - (BINIPL_JNE + 5);
+        write_mem(VA(BINIPL_JNE), skip, sizeof skip);
+        *(DWORD *)(jump + 1) = (DWORD)after - (AFTER_IPLS + 5);
+        write_mem(VA(AFTER_IPLS), jump, sizeof jump);
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
@@ -333,6 +482,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
+        g_self = inst;
         apply_patches();
     }
     return TRUE;
