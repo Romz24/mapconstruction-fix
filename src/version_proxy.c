@@ -19,8 +19,9 @@
  *     from an IMG (GTAINTERFACE.dll IMGExportBuffer), it gets a coloured diamond marker instead; the
  *     colour depends on the particle name. Game files are not touched.
  *  5. The world as SA-MP has it:
- *     - IPLs of the archives that are no streamed part of a text IPL (crack, carter, truthsfarm, barriers1/2)
- *       are not loaded: the game loads them only when its story script asks (REQUEST_IPL), SA-MP never does.
+ *     - IPLs of the archives that are no streamed part of a text IPL are loaded only when SA-MP's main.scm
+ *       asks for them (REQUEST_IPL): crack (the lab inside the San Fierro factory) yes; carter, truthsfarm,
+ *       barriers1/2 no. The editor used to load them all.
  *     - SAMP\SAMP.ipl is loaded: SA-MP's gta.dat (from samp.saa) adds it after the game's IPLs.
  *     - The 74 objects SA-MP's main.scm makes as the game starts (cranes with their LODs, doors, portakabins,
  *       the searchlights of Area 51...) are loaded as one more IPL (scm_objects_ipl.h).
@@ -122,6 +123,7 @@ static HINSTANCE g_self;
    a text IPL), then "Processing LOD hierarchy" */
 #define BINIPL_JNE        0x4E4882   /* jne <next> when the IPL was loaded already                       */
 #define BINIPL_NEXT       0x4E4941
+#define BINIPL_LOAD       0x4E4888   /* loads it: [ebp-0C4h] holds its name                                */
 #define AFTER_IPLS        0x4E494D   /* mov edx,'Processing LOD hierarchy'                               */
 #define AFTER_IPLS_BACK   0x4E4952
 #define STR_LOD_HIERARCHY 0x4E5428
@@ -422,6 +424,36 @@ static void after_ipls(void)
                                   g_script_visibility[i].z, g_script_visibility[i].radius, g_script_visibility[i].visible);
 }
 
+/* The IPLs SA-MP's main.scm (R3) asks for as it starts: REQUEST_IPL 'CRACK' at 0xC3D5 of the script */
+static int __cdecl requested_ipl(const char *name)
+{
+    return name && lstrcmpiA(name, "crack.ipl") == 0;
+}
+
+static int g_requested;
+
+/* In the loop over the archives' IPLs not loaded yet, at "jne <next>" (ZF from inc eax: eax = IndexOf + 1):
+   one already loaded goes on to the next as before, one that isn't is loaded only if the script asked */
+static BYTE *build_binipl_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+    *e.p++ = 0x0F; e_rel(&e, 0x85, BINIPL_NEXT);          /* jne next (loaded already)    */
+    *e.p++ = 0x60;                                        /* pushad                       */
+    e_bytes(&e, "\xFF\xB5\x3C\xFF\xFF\xFF", 6);       /* push dword [ebp-0C4h] (name) */
+    e_rel(&e, 0xE8, (DWORD)requested_ipl);
+    e_bytes(&e, "\x83\xC4\x04", 3);                      /* add esp,4                    */
+    *e.p++ = 0xA3; e_u32(&e, (DWORD)&g_requested);        /* mov [g_requested],eax        */
+    *e.p++ = 0x61;                                        /* popad                        */
+    e_bytes(&e, "\x83\x3D", 2); e_u32(&e, (DWORD)&g_requested); *e.p++ = 0;   /* cmp [g_requested],0 */
+    *e.p++ = 0x0F; e_rel(&e, 0x84, BINIPL_NEXT);          /* je next (not asked for)      */
+    e_rel(&e, 0xE9, BINIPL_LOAD);                         /* load it                      */
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
 /* At "mov edx,'Processing LOD hierarchy'": our IPLs, then the instruction it replaced */
 static BYTE *build_after_ipls_stub(void)
 {
@@ -443,14 +475,15 @@ static void apply_patches(void)
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
     static const DWORD share_all[2] = {FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE};
     BYTE hook[13];
-    BYTE *stub, *after;
+    BYTE *stub, *after, *binipl;
     DWORD ed = (DWORD)&g_editor_dir;
     size_t i;
 
     if (!editor_matches()) return;
     stub = build_stub();
     after = build_after_ipls_stub();
-    if (!stub || !after) return;
+    binipl = build_binipl_stub();
+    if (!stub || !after || !binipl) return;
 
     write_mem(VA(PROBE_JNE), probe_new, sizeof probe_new);
     write_mem(VA(SHARE_TABLE), share_all, sizeof share_all);
@@ -468,9 +501,9 @@ static void apply_patches(void)
     }
 
     {
-        BYTE skip[6] = {0xE9, 0, 0, 0, 0, 0x90};          /* jmp <next>: no IPL is left over to load */
+        BYTE skip[6] = {0xE9, 0, 0, 0, 0, 0x90};          /* jmp to the check of what the script asked */
         BYTE jump[5] = {0xE9};
-        *(DWORD *)(skip + 1) = BINIPL_NEXT - (BINIPL_JNE + 5);
+        *(DWORD *)(skip + 1) = (DWORD)binipl - (BINIPL_JNE + 5);
         write_mem(VA(BINIPL_JNE), skip, sizeof skip);
         *(DWORD *)(jump + 1) = (DWORD)after - (AFTER_IPLS + 5);
         write_mem(VA(AFTER_IPLS), jump, sizeof jump);
