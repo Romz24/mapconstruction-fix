@@ -1,7 +1,9 @@
 /*
  * Offline test for the effect-marker hook: loads the real GTAINTERFACE.dll, opens IMG archives and runs
  * every DFF through hook_IMGExportBuffer exactly like the editor does.
- * Checks: effect-only models become the marker, every other file comes back byte-identical.
+ * Checks: effect-only models become the marker; every other file comes back byte-identical, except that
+ * the matrices in its frame list are identity (as the game loads objs/tobj models). Models whose frames
+ * were not identity are listed.
  *
  * Usage: test_markers.exe <folder with GTAINTERFACE.dll> <img> [<img> ...]
  */
@@ -20,6 +22,8 @@ int main(int argc, char **argv)
     IMGLoadImg_t load; IMGFileCount_t count; IMGGetFileName_t getname; IMGGetThisFile_t getfile; IMGExportBuffer_t exportbuf;
     int a, failures = 0;
 
+    g_frames_patched = TRUE;            /* no IDE here: every DFF is treated as an objs/tobj model */
+
     if (argc < 3) { printf("usage: %s <editor folder> <img>...\n", argv[0]); return 2; }
     snprintf(dll, sizeof dll, "%s\\GTAINTERFACE.dll", argv[1]);
     gi = LoadLibraryA(dll);
@@ -31,7 +35,7 @@ int main(int argc, char **argv)
     exportbuf = (IMGExportBuffer_t)GetProcAddress(gi, "IMGExportBuffer");
 
     for (a = 2; a < argc; a++) {
-        int i, n, dffs = 0, markers = 0, same = 0;
+        int i, n, dffs = 0, markers = 0, same = 0, frames = 0;
         load(argv[a]);
         n = count();
         for (i = 0; i < n; i++) {
@@ -46,15 +50,18 @@ int main(int argc, char **argv)
             hook_IMGExportBuffer(i, hooked);
             dffs++;
             if (!memcmp(hooked, orig, size)) same++;
-            else if (!memcmp(hooked + 12, marker_dff + 12, MARKER_PRELIT_OFFSET - 12)) {
+            else if (reset_frames(orig, size), !memcmp(hooked, orig, size)) {
+                frames++;
+                printf("  frames  %s\n", name);
+            } else if (!memcmp(hooked + 12, marker_dff + 12, MARKER_PRELIT_OFFSET - 12)) {
                 markers++;
                 printf("  marker  %-24s colour %02x%02x%02x\n", name,
                        hooked[MARKER_MATCOL_OFFSET], hooked[MARKER_MATCOL_OFFSET + 1], hooked[MARKER_MATCOL_OFFSET + 2]);
             } else { printf("  CHANGED %s but not a marker!\n", name); failures++; }
             free(orig); free(hooked);
         }
-        printf("%s: %d dff, %d markers, %d unchanged\n", argv[a], dffs, markers, same);
-        if (markers + same != dffs) failures++;
+        printf("%s: %d dff, %d markers, %d frames reset, %d unchanged\n", argv[a], dffs, markers, frames, same);
+        if (markers + frames + same != dffs) failures++;
     }
     printf(failures ? "FAILED\n" : "OK\n");
     return failures ? 1 : 0;

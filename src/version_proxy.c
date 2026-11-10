@@ -343,6 +343,97 @@ static void write_marker(BYTE *buf, DWORD colour)
     buf[MARKER_MATCOL_OFFSET + 3] = 255;
 }
 
+/* ---------- frames of simple objects, as the game has them ----------
+ * The game loads a model of an objs/tobj IDE section as atomics only: every atomic is taken out of the
+ * DFF's clump and given a new identity frame (CFileLoader::SetRelatedModelInfoCB), so the frame
+ * transforms in the DFF do nothing. The editor applies them. Most DFFs have identity frames, but some
+ * don't: lhouse_barrier1/2/3 (996/994/997) shift their geometry by 1.6-3.4 m along X, 0.5 m along Y and
+ * -0.6..+0.2 m in height, each by a different amount, so barriers lined up in the editor stand apart in
+ * the game. Each DFF the editor reads from an IMG gets identity frames, unless its model comes from
+ * another section (anim, peds, cars, hier, weap), where the game keeps the hierarchy too. Those names are
+ * noted as the editor's IDE loader reads them (hook at 0x4FC2D9, where the definition has its name). */
+
+#define IDE_SECTION_HOOK  0x4FC2D9   /* mov eax,[ebp-18h] (section); mov edx,'objs' - 8 bytes            */
+#define IDE_SECTION_BACK  0x4FC2E1
+#define STR_OBJS          0x4FC52C
+
+static const BYTE IDE_SECTION_ORIG[8] = {0x8B,0x45,0xE8, 0xBA,0x2C,0xC5,0x4F,0x00};
+
+static BOOL g_frames_patched;        /* the IDE loader hook is in, so g_keep_frames is filled */
+static char (*g_keep_frames)[24];    /* lower-case model names whose DFF keeps its frames */
+static int g_keep_count, g_keep_cap;
+
+static void lower_name(char *dst, const char *src, int n)
+{
+    int i;
+    for (i = 0; i < n - 1 && src[i] && src[i] != '.'; i++)
+        dst[i] = (char)((src[i] >= 'A' && src[i] <= 'Z') ? src[i] + 32 : src[i]);
+    dst[i] = 0;
+}
+
+static BOOL keeps_frames(const char *dffname)
+{
+    char n[24];
+    int i;
+    lower_name(n, dffname, sizeof n);
+    for (i = 0; i < g_keep_count; i++)
+        if (!strcmp(g_keep_frames[i], n)) return TRUE;
+    return FALSE;
+}
+
+/* called from the IDE loader for every definition: section and model name are Delphi strings */
+static void __stdcall ide_definition(const char *section, const BYTE *def)
+{
+    const char *name = *(const char **)(def + 8);
+    if (!section || !name) return;
+    if (!lstrcmpiA(section, "objs") || !lstrcmpiA(section, "tobj")) return;
+    if (keeps_frames(name)) return;
+    if (g_keep_count == g_keep_cap) {
+        int cap = g_keep_cap ? g_keep_cap * 2 : 256;
+        void *p = realloc(g_keep_frames, cap * sizeof *g_keep_frames);
+        if (!p) return;
+        g_keep_frames = (char (*)[24])p;
+        g_keep_cap = cap;
+    }
+    lower_name(g_keep_frames[g_keep_count++], name, 24);
+}
+
+static BYTE *build_ide_section_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+    e_bytes(&e, "\x60", 1);                               /* pushad                       */
+    e_bytes(&e, "\xFF\x75\xE0", 3);                       /* push [ebp-20h]  (definition) */
+    e_bytes(&e, "\xFF\x75\xE8", 3);                       /* push [ebp-18h]  (section)    */
+    e_rel(&e, 0xE8, (DWORD)ide_definition);
+    e_bytes(&e, "\x61", 1);                               /* popad                        */
+    e_bytes(&e, IDE_SECTION_ORIG, sizeof IDE_SECTION_ORIG);/* mov eax,[ebp-18h]; mov edx,'objs' */
+    e_rel(&e, 0xE9, IDE_SECTION_BACK);
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
+/* every frame of the clump's frame list: identity rotation, zero position (parents stay) */
+static void reset_frames(BYTE *b, DWORD size)
+{
+    DWORD pos = 12, end = 12 + rd32(b + 4);
+    if (end > size) return;
+    while (pos + 12 <= end) {
+        DWORD type = rd32(b + pos), csize = rd32(b + pos + 4), p = pos + 12;
+        if (csize > end - p) return;
+        if (type == 0x0E && csize >= 16 && rd32(b + p) == 1) {   /* Frame List: Struct {count, frames} */
+            DWORD n = rd32(b + p + 12), i;
+            static const float ident[12] = {1,0,0, 0,1,0, 0,0,1, 0,0,0};
+            if (16 + n * 56 > csize) return;
+            for (i = 0; i < n; i++) memcpy(b + p + 16 + i * 56, ident, sizeof ident);
+            return;
+        }
+        pos = p + csize;
+    }
+}
+
 static void WINAPI hook_IMGExportBuffer(int index, void *buf)
 {
     BYTE rec[32];
@@ -369,6 +460,8 @@ static void WINAPI hook_IMGExportBuffer(int index, void *buf)
     scan_chunks((const BYTE *)buf, 0, size, &s, 0);
     if (s.fx[0] && s.has_geom && s.max_radius < FX_MAX_RADIUS)
         write_marker((BYTE *)buf, fx_colour(s.fx));
+    else if (g_frames_patched && !keeps_frames((const char *)rec + 8))
+        reset_frames((BYTE *)buf, size);
 }
 
 /* ---------- the world as SA-MP has it ---------- */
@@ -926,6 +1019,17 @@ static void apply_patches(void)
     *(DWORD *)(hook + 1) = (DWORD)stub - (HOOK_SITE + 5);
     memset(hook + 5, 0x90, 8);
     write_mem(VA(HOOK_SITE), hook, sizeof hook);
+
+    if (!memcmp(VA(IDE_SECTION_HOOK), IDE_SECTION_ORIG, sizeof IDE_SECTION_ORIG) &&
+        *(DWORD *)VA(IDE_SECTION_HOOK + 4) == STR_OBJS) {
+        BYTE *ide = build_ide_section_stub();
+        if (ide) {
+            BYTE jmp[8] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+            *(DWORD *)(jmp + 1) = (DWORD)ide - (IDE_SECTION_HOOK + 5);
+            write_mem(VA(IDE_SECTION_HOOK), jmp, sizeof jmp);
+            g_frames_patched = TRUE;
+        }
+    }
 
     {
         void *fn = (void *)hook_IMGExportBuffer;
