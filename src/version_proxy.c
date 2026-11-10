@@ -154,6 +154,15 @@ static const BYTE CLOSE_ORIG[11]  = {0x8B,0x45,0xF4, 0x50, 0x6A,0x00, 0x68,0x01,
 
 static const DWORD g_camerahere_calls[6] = {0x4E9982, 0x4E999B, 0x4E99B4, 0x4E99CA, 0x4E99DB, 0x4E99EC};
 
+/* <INSERT> "Add object" (0x4EA8EC) takes any number from "Enter IDE number" and calls
+   TForm1.insertobject(ID, x, y, z) (0x4EA594), which adds the instance to the map unchecked. With an ID
+   that no IDE defines (111111) every redraw then fails with "Range check error", the message box comes
+   back at once and the editor can only be killed. The call goes through a stub that refuses such IDs. */
+#define ADDOBJ_CALL       0x4EAA78   /* call TForm1.insertobject; edx = ID, x/y/z pushed                  */
+#define FN_INSERTOBJECT   0x4EA594   /* register (Self, ID) + 3 stack args, ret 0Ch                         */
+#define IDE_BY_ID         0x57A5B8   /* array[0..19999] of the IDE definition, nil when not defined        */
+#define IDE_MAX_ID        19999
+
 /* ---------- helpers ---------- */
 
 static BOOL write_mem(void *dst, const void *src, SIZE_T n)
@@ -191,6 +200,8 @@ static BOOL editor_matches(void)
         BYTE *c = VA(g_camerahere_calls[i]);
         if (c[0] != 0xE8 || g_camerahere_calls[i] + 5 + *(DWORD *)(c + 1) != FN_GETFLOAT) return FALSE;
     }
+    if (VA(ADDOBJ_CALL)[0] != 0xE8 || ADDOBJ_CALL + 5 + *(DWORD *)VA(ADDOBJ_CALL + 1) != FN_INSERTOBJECT)
+        return FALSE;
     for (i = 0; i < sizeof g_editor_refs / sizeof g_editor_refs[0]; i++)
         if (memcmp(VA(g_editor_refs[i]), &gd, 4)) return FALSE;
     return TRUE;
@@ -528,12 +539,41 @@ static BYTE *build_getfloat_stub(void)
     return mem;
 }
 
+static BOOL __stdcall insert_id_ok(int id)
+{
+    char msg[160];
+    if (id >= 0 && id <= IDE_MAX_ID && ((void **)IDE_BY_ID)[id]) return TRUE;
+    wsprintfA(msg, "There is no object with ID %d in the loaded IDE files.", id);
+    MessageBoxA(GetActiveWindow(), msg, "Add object", MB_OK | MB_ICONWARNING);
+    return FALSE;
+}
+
+/* In place of "call TForm1.insertobject" in the <INSERT> handler: inserts only an ID some IDE defines */
+static BYTE *build_addobj_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+
+    e_bytes(&e, "\x52\x50\x52", 3);                       /* push edx; push eax; push edx */
+    e_rel(&e, 0xE8, (DWORD)insert_id_ok);                 /* call insert_id_ok(ID)        */
+    e_bytes(&e, "\x85\xC0", 2);                           /* test eax,eax                 */
+    e_bytes(&e, "\x58\x5A", 2);                           /* pop eax; pop edx             */
+    e_bytes(&e, "\x74\x05", 2);                           /* jz refuse                    */
+    e_rel(&e, 0xE9, FN_INSERTOBJECT);                     /* insertobject(Self, ID, x,y,z)*/
+    e_bytes(&e, "\xC2\x0C\x00", 3);                       /* refuse: ret 0Ch (drop x,y,z) */
+
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
     static const DWORD share_all[2] = {FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE};
     BYTE hook[13];
-    BYTE *stub, *after, *binipl, *getfloat;
+    BYTE *stub, *after, *binipl, *getfloat, *addobj;
     DWORD ed = (DWORD)&g_editor_dir;
     size_t i;
 
@@ -542,7 +582,8 @@ static void apply_patches(void)
     after = build_after_ipls_stub();
     binipl = build_binipl_stub();
     getfloat = build_getfloat_stub();
-    if (!stub || !after || !binipl || !getfloat) return;
+    addobj = build_addobj_stub();
+    if (!stub || !after || !binipl || !getfloat || !addobj) return;
 
     write_mem(VA(PROBE_JNE), probe_new, sizeof probe_new);
     write_mem(VA(SHARE_TABLE), share_all, sizeof share_all);
@@ -577,6 +618,11 @@ static void apply_patches(void)
     for (i = 0; i < sizeof g_camerahere_calls / sizeof g_camerahere_calls[0]; i++) {
         DWORD rel = (DWORD)getfloat - (g_camerahere_calls[i] + 5);
         write_mem(VA(g_camerahere_calls[i] + 1), &rel, 4);
+    }
+
+    {
+        DWORD rel = (DWORD)addobj - (ADDOBJ_CALL + 5);
+        write_mem(VA(ADDOBJ_CALL + 1), &rel, 4);
     }
 }
 
