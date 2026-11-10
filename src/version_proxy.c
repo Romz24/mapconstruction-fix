@@ -27,11 +27,18 @@
  *       the searchlights of Area 51...) are loaded as one more IPL (scm_objects_ipl.h).
  *     - What that main.scm hides with SET_VISIBILITY_OF_CLOSEST_OBJECT_OF_TYPE (the burnt shell of the San
  *       Fierro crack factory and its LOD) is hidden, and never exported as RemoveBuildingForPlayer.
+ *  6. Closing one editor no longer terminates every editor.exe.
+ *  7. "Point camera at these Coords" with only "x, y" keeps the camera height instead of failing.
+ *  8. <INSERT> refuses an object ID that no loaded IDE defines (it used to break every redraw).
+ *  9. The placed objects are backed up to backups\objects_<session start>.pwn next to the editor.
  *
  * If the bytes at any patch site differ from the expected ones (another editor build), nothing is patched.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "marker_dff.h"
 #include "scm_objects_ipl.h"
@@ -137,9 +144,9 @@ static const BYTE AFTER_ORIG[5]   = {0xBA,0x28,0x54,0x4E,0x00};
 /* TForm1.FormClose (0x4E7DF4): after saving bookmarks/views it calls OpenProcess+TerminateProcess on an
    uninitialised PID, then KillTask(ExtractFileName(ExeName)) (0x4DCF10), which walks a Toolhelp snapshot
    and terminates every process named editor.exe - every other open editor too. Replaced by terminating
-   only this process (the editor got there itself, when the walk reached it). */
+   only this process (the editor got there itself, when the walk reached it), after a last backup of
+   the placed objects (editor_exit). */
 #define CLOSE_KILL        0x4E7E22   /* mov eax,[ebp-0Ch]; push eax; push 0; push 401h; call OpenProcess  */
-#define FN_TERMINATEPROC  0x4068BC   /* thunk: jmp [TerminateProcess]                                   */
 
 static const BYTE CLOSE_ORIG[11]  = {0x8B,0x45,0xF4, 0x50, 0x6A,0x00, 0x68,0x01,0x04,0x00,0x00};
 
@@ -568,6 +575,150 @@ static BYTE *build_addobj_stub(void)
     return mem;
 }
 
+/* ---------- backup of the placed objects ----------
+ * Every BACKUP_PERIOD ms (a thread timer of the editor's main thread, so the map is never read while the
+ * editor changes it) the objects the editor would export - added objects and removed buildings, the same
+ * test and lines as btn_exportmapClick (0x4E9B50) - are written to backups\objects_<session start>.pwn
+ * next to the editor, when they changed. One file per session: a new start never overwrites what a crashed
+ * one left. The file is written to .tmp and moved over, so a crash while writing keeps the previous one.
+ * The editor's import reads the CreateObject / RemoveBuildingForPlayer lines back. */
+
+#define BACKUP_PERIOD     2000
+#define INST_ADDED        0x3A       /* byte: 1 = added in the editor                                      */
+#define INST_REMOVED      0x3B       /* byte: 1 = removed (exported as RemoveBuildingForPlayer)            */
+
+typedef struct { char *p; size_t len, cap; } textbuf;
+
+static void tb_printf(textbuf *t, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (t->cap - t->len < 512) {
+        size_t cap = t->cap ? t->cap * 2 : 65536;
+        char *p = (char *)realloc(t->p, cap);
+        if (!p) return;
+        t->p = p; t->cap = cap;
+    }
+    va_start(ap, fmt);
+    n = _vsnprintf_s(t->p + t->len, t->cap - t->len, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n > 0) t->len += n;
+}
+
+static int dynlen(const void *arr) { return arr ? ((const int *)arr)[-1] : 0; }
+
+/* the lines of btn_exportmapClick (absolute coordinates), or FALSE when the map is not readable */
+static BOOL collect_objects(textbuf *t, int *count)
+{
+    __try {
+        BYTE *map = *(BYTE **)MAP_PTR;
+        BYTE **ipls;
+        int i, j;
+        *count = 0;
+        if (!map) return TRUE;
+        ipls = *(BYTE ***)(map + 0x3C);
+        for (i = 0; i < dynlen(ipls); i++) {
+            BYTE **insts = *(BYTE ***)(ipls[i] + 8);
+            for (j = 0; j < dynlen(insts); j++) {
+                BYTE *o = insts[j];
+                int id = *(int *)(o + 4);
+                float *pos = (float *)(o + 0x18), *rot = (float *)(o + 0x40);
+                if (o[INST_REMOVED] == 0 && o[INST_ADDED] == 1) {
+                    if (id >= 400 && id <= 611)
+                        tb_printf(t, "CreateVehicle(%d, %0.4f, %0.4f, %0.4f, %0.4f, -1, -1, 100);\r\n",
+                                  id, pos[0], pos[1], pos[2], rot[2]);
+                    else
+                        tb_printf(t, "CreateObject(%d, %0.5f, %0.5f, %0.5f,   %0.5f, %0.5f, %0.5f);\r\n",
+                                  id, pos[0], pos[1], pos[2], rot[0], rot[1], rot[2]);
+                    ++*count;
+                } else if (o[INST_REMOVED] == 1 && o[INST_ADDED] == 0) {
+                    tb_printf(t, "RemoveBuildingForPlayer(playerid, %d, %0.4f, %0.4f, %0.4f, 0.25);\r\n",
+                              id, pos[0], pos[1], pos[2]);
+                    ++*count;
+                }
+            }
+        }
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+}
+
+static char g_backup_path[MAX_PATH];
+static char g_session_time[32];
+static unsigned __int64 g_backup_hash;
+static BOOL g_backup_written;
+
+static void CALLBACK backup_tick(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    textbuf body = {0}, file = {0};
+    unsigned __int64 h = 14695981039346656037ULL;
+    int count;
+    size_t i;
+    (void)hwnd; (void)msg; (void)id; (void)time;
+
+    if (!collect_objects(&body, &count)) goto done;
+    for (i = 0; i < body.len; i++) { h ^= (BYTE)body.p[i]; h *= 1099511628211ULL; }
+#ifndef BACKUP_TEST
+    if (body.len == 0 && !g_backup_written) goto done;     /* nothing placed yet: no file */
+#endif
+    if (g_backup_written && h == g_backup_hash) goto done;
+
+    {
+        SYSTEMTIME st;
+        char tmp[MAX_PATH + 4];
+        HANDLE f;
+        DWORD wr;
+        BOOL ok;
+        GetLocalTime(&st);
+        tb_printf(&file, "// SA-MP Map Construction: backup of the placed objects (version.dll)\r\n"
+                         "// session started %s, saved %04d-%02d-%02d %02d:%02d:%02d, %d lines\r\n\r\n",
+                  g_session_time, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, count);
+        if (!file.p) goto done;
+        wsprintfA(tmp, "%s.tmp", g_backup_path);
+        f = CreateFileA(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE) goto done;
+        ok = WriteFile(f, file.p, (DWORD)file.len, &wr, NULL) && wr == file.len;
+        if (ok && body.len) ok = WriteFile(f, body.p, (DWORD)body.len, &wr, NULL) && wr == body.len;
+        ok = FlushFileBuffers(f) && ok;
+        CloseHandle(f);
+        if (ok && MoveFileExA(tmp, g_backup_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            g_backup_hash = h;
+            g_backup_written = TRUE;
+        } else {
+            DeleteFileA(tmp);
+        }
+    }
+done:
+    free(body.p);
+    free(file.p);
+}
+
+static void start_backup(void)
+{
+    char dir[MAX_PATH];
+    char *slash;
+    SYSTEMTIME st;
+    DWORD n = GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (!n || n >= MAX_PATH || !(slash = strrchr(dir, '\\'))) return;
+    lstrcpyA(slash, "\\backups");
+    CreateDirectoryA(dir, NULL);
+    GetLocalTime(&st);
+    wsprintfA(g_session_time, "%04d-%02d-%02d %02d:%02d:%02d",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    if (lstrlenA(dir) + 48 >= MAX_PATH) return;
+    wsprintfA(g_backup_path, "%s\\objects_%04d-%02d-%02d_%02d-%02d-%02d_%lu.pwn", dir,
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId());
+    SetTimer(NULL, 0, BACKUP_PERIOD, backup_tick);
+}
+
+/* replaces the kill at the end of FormClose: the last state goes to the backup, then this editor ends */
+static void editor_exit(void)
+{
+    if (g_backup_path[0]) backup_tick(NULL, 0, 0, 0);
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
@@ -610,8 +761,8 @@ static void apply_patches(void)
     }
 
     {
-        BYTE kill[9] = {0x6A, 0x00, 0x6A, 0xFF, 0xE8};    /* push 0; push -1; call TerminateProcess */
-        *(DWORD *)(kill + 5) = (DWORD)FN_TERMINATEPROC - (CLOSE_KILL + 9);
+        BYTE kill[5] = {0xE8};                            /* call editor_exit (never returns) */
+        *(DWORD *)(kill + 1) = (DWORD)editor_exit - (CLOSE_KILL + 5);
         write_mem(VA(CLOSE_KILL), kill, sizeof kill);
     }
 
@@ -624,6 +775,8 @@ static void apply_patches(void)
         DWORD rel = (DWORD)addobj - (ADDOBJ_CALL + 5);
         write_mem(VA(ADDOBJ_CALL + 1), &rel, 4);
     }
+
+    start_backup();
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
