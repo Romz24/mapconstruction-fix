@@ -15,9 +15,10 @@
  *     otherwise its parent folder. The editor's own files (gta_shapes\ cache, PrefabPics\) are
  *     built from the editor folder instead of the game folder.
  *  4. Visible SA-MP effect objects (fire, smoke, explosions, water...): their DFFs contain only a 1 mm
- *     triangle plus a particle 2dEffect, so the editor shows nothing. When the editor reads such a model
- *     from an IMG (GTAINTERFACE.dll IMGExportBuffer), it gets a coloured diamond marker instead; the
- *     colour depends on the particle name. Game files are not touched.
+ *     triangle plus a particle 2dEffect, so the editor shows nothing. The editor shows their particles as
+ *     the game plays them (models\effects.fxp, effectsPC.txd; fx.cpp), and a small coloured dot at the
+ *     point of the effect: when it reads such a model from an IMG (GTAINTERFACE.dll IMGExportBuffer), it
+ *     gets the dot model instead; the colour depends on the particle name. Game files are not touched.
  *  5. The world as SA-MP has it:
  *     - IPLs of the archives that are no streamed part of a text IPL are loaded only when SA-MP's main.scm
  *       asks for them (REQUEST_IPL): crack (the lab inside the San Fierro factory) yes; carter, truthsfarm,
@@ -41,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "fx.h"
 #include "marker_dff.h"
 #include "scm_objects_ipl.h"
 
@@ -171,6 +173,17 @@ static const DWORD g_camerahere_calls[6] = {0x4E9982, 0x4E999B, 0x4E99B4, 0x4E99
 #define IDE_BY_ID         0x57A5B8   /* array[0..19999] of the IDE definition, nil when not defined        */
 #define IDE_MAX_ID        19999
 
+/* Particles of the effect objects (fx.cpp): the view is taken right after the scene's gluLookAt (the
+   5-byte "mov eax,[slot]" before "mov eax,[eax]; call eax" loads the address of fx_look_at_slot instead),
+   the particles are drawn at the end of the scene drawing, before the selection is read */
+#define LOOKAT_LOAD       0x4E1E94   /* mov eax,[4FF568h]; mov eax,[eax]; call eax  (gluLookAt)          */
+#define SCENE_END         0x4E3D1C   /* cmp byte [4FF28Ch],1 (picking?) - 7 bytes, then jne / call 4DDCB4 */
+#define SCENE_END_BACK    0x4E3D23
+
+static const BYTE LOOKAT_ORIG[9]    = {0xA1,0x68,0xF5,0x4F,0x00, 0x8B,0x00, 0xFF,0xD0};
+static const BYTE SCENE_END_ORIG[7] = {0x80,0x3D,0x8C,0xF2,0x4F,0x00,0x01};
+
+
 /* ---------- helpers ---------- */
 
 static BOOL write_mem(void *dst, const void *src, SIZE_T n)
@@ -266,7 +279,7 @@ static IMGGetThisFile_t  g_img_getfile;
 
 static DWORD rd32(const BYTE *p) { DWORD v; memcpy(&v, p, 4); return v; }
 
-typedef struct { BOOL has_geom; float max_radius; char fx[25]; } dff_scan;
+typedef struct { BOOL has_geom; float max_radius; char fx[25]; float fx_pos[3]; } dff_scan;
 
 /* Walks the RenderWare chunk tree in [pos, end): records geometry bounding radii and the first particle 2dEffect. */
 static void scan_chunks(const BYTE *b, DWORD pos, DWORD end, dff_scan *s, int depth)
@@ -290,7 +303,8 @@ static void scan_chunks(const BYTE *b, DWORD pos, DWORD end, dff_scan *s, int de
             DWORD n = rd32(b + p), q = p + 4, i;
             for (i = 0; i < n && q + 20 <= p + size; i++) {
                 DWORD etype = rd32(b + q + 12), dsz = rd32(b + q + 16);
-                if (etype == 1 && dsz >= 24 && q + 20 + 24 <= p + size) {   /* particle: char name[24] */
+                if (etype == 1 && dsz >= 24 && q + 20 + 24 <= p + size) {   /* particle: position, char name[24] */
+                    memcpy(s->fx_pos, b + q, 12);
                     memcpy(s->fx, b + q + 20, 24); s->fx[24] = 0; break;
                 }
                 if (dsz > p + size - q - 20) break;
@@ -458,8 +472,10 @@ static void WINAPI hook_IMGExportBuffer(int index, void *buf)
 
     memset(&s, 0, sizeof s);
     scan_chunks((const BYTE *)buf, 0, size, &s, 0);
-    if (s.fx[0] && s.has_geom && s.max_radius < FX_MAX_RADIUS)
+    if (s.fx[0] && s.has_geom && s.max_radius < FX_MAX_RADIUS) {
         write_marker((BYTE *)buf, fx_colour(s.fx));
+        fx_note_model((const char *)rec + 8, s.fx, s.fx_pos);   /* its particles are drawn by fx.cpp */
+    }
     else if (g_frames_patched && !keeps_frames((const char *)rec + 8))
         reset_frames((BYTE *)buf, size);
 }
@@ -587,6 +603,22 @@ static BYTE *build_binipl_stub(void)
     e_bytes(&e, "\x83\x3D", 2); e_u32(&e, (DWORD)&g_requested); *e.p++ = 0;   /* cmp [g_requested],0 */
     *e.p++ = 0x0F; e_rel(&e, 0x84, BINIPL_NEXT);          /* je next (not asked for)      */
     e_rel(&e, 0xE9, BINIPL_LOAD);                         /* load it                      */
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
+/* At the end of the scene drawing: the particles, then the instruction it replaced */
+static BYTE *build_scene_end_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+    *e.p++ = 0x60;                                        /* pushad                       */
+    e_rel(&e, 0xE8, (DWORD)fx_after_scene);               /* call fx_after_scene          */
+    *e.p++ = 0x61;                                        /* popad                        */
+    e_bytes(&e, SCENE_END_ORIG, sizeof SCENE_END_ORIG);   /* cmp byte [picking],1         */
+    e_rel(&e, 0xE9, SCENE_END_BACK);
     FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
     return mem;
 }
@@ -1034,6 +1066,19 @@ static void apply_patches(void)
     {
         void *fn = (void *)hook_IMGExportBuffer;
         write_mem(VA(IAT_IMGEXPORTBUFFER), &fn, 4);
+    }
+
+    if (!memcmp(VA(LOOKAT_LOAD), LOOKAT_ORIG, sizeof LOOKAT_ORIG) &&
+        !memcmp(VA(SCENE_END), SCENE_END_ORIG, sizeof SCENE_END_ORIG)) {
+        BYTE *scene_end = build_scene_end_stub();
+        if (scene_end) {
+            BYTE load[5] = {0xB8};                        /* mov eax,&fx_look_at_slot     */
+            BYTE jmp[7] = {0xE9, 0, 0, 0, 0, 0x90, 0x90};
+            *(DWORD *)(load + 1) = (DWORD)&fx_look_at_slot;
+            *(DWORD *)(jmp + 1) = (DWORD)scene_end - (SCENE_END + 5);
+            write_mem(VA(LOOKAT_LOAD), load, sizeof load);
+            write_mem(VA(SCENE_END), jmp, sizeof jmp);
+        }
     }
 
     {

@@ -17,6 +17,6 @@ set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul || exit /b 1
 
 if not exist build mkdir build
-cl /nologo /O2 /MT /W3 test\test_markers.c /Fo"build\\" /Fe"build\test_markers.exe" /link /NOLOGO kernel32.lib user32.lib shell32.lib || exit /b 1
+cl /nologo /O2 /MT /W3 /EHsc test\test_markers.c src\fx.cpp /Fo"build\\" /Fe"build\test_markers.exe" /link /NOLOGO kernel32.lib user32.lib shell32.lib || exit /b 1
 
 build\test_markers.exe "%EDITOR%" "%GAME%\SAMP\SAMP.img" "%GAME%\SAMP\custom.img" "%GAME%\models\gta3.img" "%GAME%\models\gta_int.img"

@@ -26,7 +26,7 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul || (
 )
 
 if not exist build mkdir build
-cl /nologo /O2 /GS- /MT /W4 /LD src\version_proxy.c /Fo"build\\" /Fe"build\version.dll" ^
+cl /nologo /O2 /GS- /MT /W4 /EHsc /LD src\version_proxy.c src\fx.cpp /Fo"build\\" /Fe"build\version.dll" ^
    /link /DEF:src\version.def /NOLOGO /DYNAMICBASE:NO /INCREMENTAL:NO kernel32.lib user32.lib shell32.lib
 if errorlevel 1 (
     echo [error] build failed.

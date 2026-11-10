@@ -1,4 +1,4 @@
-"""Generates src/marker_dff.h - the placeholder model shown instead of SA-MP effect objects.
+"""Generates src/marker_dff.h - the dot shown at the point of SA-MP effect objects (their particles are drawn by fx.cpp).
 
 The model is a double-sided octahedron (diamond) centred on the effect point, written as a
 RenderWare 3.6 (0x1803FFFF) clump with the same chunk layout as the SA-MP effect DFFs.
@@ -12,8 +12,8 @@ import os
 import struct
 
 RW_VER = 0x1803FFFF
-HEIGHT = 0.6        # top/bottom tip distance from the centre, metres
-RADIUS = 0.35       # ring radius, metres
+HEIGHT = 0.08       # top/bottom tip distance from the centre, metres: a small dot at the effect point
+RADIUS = 0.05       # ring radius, metres
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'marker_dff.h')
 
 
