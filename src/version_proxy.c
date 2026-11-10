@@ -143,6 +143,17 @@ static const BYTE AFTER_ORIG[5]   = {0xBA,0x28,0x54,0x4E,0x00};
 
 static const BYTE CLOSE_ORIG[11]  = {0x8B,0x45,0xF4, 0x50, 0x6A,0x00, 0x68,0x01,0x04,0x00,0x00};
 
+/* TForm1.btn_camerahereClick ("Point camera at these Coords", 0x4E9948) splits the coordinates field and
+   reads three numbers with GetFloat(i) (0x4999D4), which checks "Count >= i" instead of "Count > i": with
+   only "x, y" it raises "List index out of bounds (2)" after the camera X/Y were written, leaving the
+   camera half-moved. Its six GetFloat calls go through a stub: a missing number is the current look-at
+   coordinate, so "x, y" keeps the camera's height. */
+#define FN_GETFLOAT       0x4999D4   /* GetFloat(Index): Single, from the list SplitCoords filled           */
+#define COORD_LIST        0x500C6C   /* that TStringList                                                   */
+#define CAM_LOOKAT        0x578F04   /* camera look-at X, Y, Z (Single)                                    */
+
+static const DWORD g_camerahere_calls[6] = {0x4E9982, 0x4E999B, 0x4E99B4, 0x4E99CA, 0x4E99DB, 0x4E99EC};
+
 /* ---------- helpers ---------- */
 
 static BOOL write_mem(void *dst, const void *src, SIZE_T n)
@@ -176,6 +187,10 @@ static BOOL editor_matches(void)
     if (memcmp(VA(BINIPL_JNE), BINIPL_ORIG, sizeof BINIPL_ORIG)) return FALSE;
     if (memcmp(VA(AFTER_IPLS), AFTER_ORIG, sizeof AFTER_ORIG)) return FALSE;
     if (memcmp(VA(CLOSE_KILL), CLOSE_ORIG, sizeof CLOSE_ORIG)) return FALSE;
+    for (i = 0; i < sizeof g_camerahere_calls / sizeof g_camerahere_calls[0]; i++) {
+        BYTE *c = VA(g_camerahere_calls[i]);
+        if (c[0] != 0xE8 || g_camerahere_calls[i] + 5 + *(DWORD *)(c + 1) != FN_GETFLOAT) return FALSE;
+    }
     for (i = 0; i < sizeof g_editor_refs / sizeof g_editor_refs[0]; i++)
         if (memcmp(VA(g_editor_refs[i]), &gd, 4)) return FALSE;
     return TRUE;
@@ -480,12 +495,45 @@ static BYTE *build_after_ipls_stub(void)
     return mem;
 }
 
+/* GetFloat(eax = index) for btn_camerahereClick: the editor's GetFloat when the list has that number,
+   otherwise the current look-at coordinate with that index. Returns in st(0) like the original. */
+static BYTE *build_getfloat_stub(void)
+{
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    BYTE *je_at, *jle_at;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+
+    e_bytes(&e, "\x50", 1);                               /* push eax (index)             */
+    e_bytes(&e, "\x8B\x0D", 2); e_u32(&e, COORD_LIST);    /* mov ecx,[list]               */
+    e_bytes(&e, "\x85\xC9", 2);                           /* test ecx,ecx                 */
+    je_at = e.p; e_bytes(&e, "\x74\x00", 2);              /* je no_list                   */
+    e_bytes(&e, "\x8B\xC1", 2);                           /* mov eax,ecx                  */
+    e_bytes(&e, "\x8B\x10", 2);                           /* mov edx,[eax]                */
+    e_bytes(&e, "\xFF\x52\x14", 3);                       /* call [edx+14h]  (GetCount)   */
+    e_bytes(&e, "\x5A", 1);                               /* pop edx                      */
+    e_bytes(&e, "\x3B\xC2", 2);                           /* cmp eax,edx                  */
+    jle_at = e.p; e_bytes(&e, "\x7E\x00", 2);             /* jle missing                  */
+    e_bytes(&e, "\x8B\xC2", 2);                           /* mov eax,edx                  */
+    e_rel(&e, 0xE9, FN_GETFLOAT);                         /* the editor's GetFloat        */
+
+    je_at[1] = (BYTE)(e.p - (je_at + 2));                 /* no_list:                     */
+    e_bytes(&e, "\x5A", 1);                               /* pop edx                      */
+    jle_at[1] = (BYTE)(e.p - (jle_at + 2));               /* missing:                     */
+    e_bytes(&e, "\xD9\x04\x95", 3); e_u32(&e, CAM_LOOKAT);/* fld dword [CamLookAt+edx*4]  */
+    e_bytes(&e, "\xC3", 1);                               /* ret                          */
+
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
     static const DWORD share_all[2] = {FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE};
     BYTE hook[13];
-    BYTE *stub, *after, *binipl;
+    BYTE *stub, *after, *binipl, *getfloat;
     DWORD ed = (DWORD)&g_editor_dir;
     size_t i;
 
@@ -493,7 +541,8 @@ static void apply_patches(void)
     stub = build_stub();
     after = build_after_ipls_stub();
     binipl = build_binipl_stub();
-    if (!stub || !after || !binipl) return;
+    getfloat = build_getfloat_stub();
+    if (!stub || !after || !binipl || !getfloat) return;
 
     write_mem(VA(PROBE_JNE), probe_new, sizeof probe_new);
     write_mem(VA(SHARE_TABLE), share_all, sizeof share_all);
@@ -523,6 +572,11 @@ static void apply_patches(void)
         BYTE kill[9] = {0x6A, 0x00, 0x6A, 0xFF, 0xE8};    /* push 0; push -1; call TerminateProcess */
         *(DWORD *)(kill + 5) = (DWORD)FN_TERMINATEPROC - (CLOSE_KILL + 9);
         write_mem(VA(CLOSE_KILL), kill, sizeof kill);
+    }
+
+    for (i = 0; i < sizeof g_camerahere_calls / sizeof g_camerahere_calls[0]; i++) {
+        DWORD rel = (DWORD)getfloat - (g_camerahere_calls[i] + 5);
+        write_mem(VA(g_camerahere_calls[i] + 1), &rel, 4);
     }
 }
 
