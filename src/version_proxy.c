@@ -134,6 +134,15 @@ static HINSTANCE g_self;
 static const BYTE BINIPL_ORIG[6]  = {0x0F,0x85,0xB9,0x00,0x00,0x00};
 static const BYTE AFTER_ORIG[5]   = {0xBA,0x28,0x54,0x4E,0x00};
 
+/* TForm1.FormClose (0x4E7DF4): after saving bookmarks/views it calls OpenProcess+TerminateProcess on an
+   uninitialised PID, then KillTask(ExtractFileName(ExeName)) (0x4DCF10), which walks a Toolhelp snapshot
+   and terminates every process named editor.exe - every other open editor too. Replaced by terminating
+   only this process (the editor got there itself, when the walk reached it). */
+#define CLOSE_KILL        0x4E7E22   /* mov eax,[ebp-0Ch]; push eax; push 0; push 401h; call OpenProcess  */
+#define FN_TERMINATEPROC  0x4068BC   /* thunk: jmp [TerminateProcess]                                   */
+
+static const BYTE CLOSE_ORIG[11]  = {0x8B,0x45,0xF4, 0x50, 0x6A,0x00, 0x68,0x01,0x04,0x00,0x00};
+
 /* ---------- helpers ---------- */
 
 static BOOL write_mem(void *dst, const void *src, SIZE_T n)
@@ -166,6 +175,7 @@ static BOOL editor_matches(void)
     if (memcmp(VA(SHARE_TABLE), SHARE_ORIG, sizeof SHARE_ORIG)) return FALSE;
     if (memcmp(VA(BINIPL_JNE), BINIPL_ORIG, sizeof BINIPL_ORIG)) return FALSE;
     if (memcmp(VA(AFTER_IPLS), AFTER_ORIG, sizeof AFTER_ORIG)) return FALSE;
+    if (memcmp(VA(CLOSE_KILL), CLOSE_ORIG, sizeof CLOSE_ORIG)) return FALSE;
     for (i = 0; i < sizeof g_editor_refs / sizeof g_editor_refs[0]; i++)
         if (memcmp(VA(g_editor_refs[i]), &gd, 4)) return FALSE;
     return TRUE;
@@ -507,6 +517,12 @@ static void apply_patches(void)
         write_mem(VA(BINIPL_JNE), skip, sizeof skip);
         *(DWORD *)(jump + 1) = (DWORD)after - (AFTER_IPLS + 5);
         write_mem(VA(AFTER_IPLS), jump, sizeof jump);
+    }
+
+    {
+        BYTE kill[9] = {0x6A, 0x00, 0x6A, 0xFF, 0xE8};    /* push 0; push -1; call TerminateProcess */
+        *(DWORD *)(kill + 5) = (DWORD)FN_TERMINATEPROC - (CLOSE_KILL + 9);
+        write_mem(VA(CLOSE_KILL), kill, sizeof kill);
     }
 }
 
