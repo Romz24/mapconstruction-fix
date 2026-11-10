@@ -884,6 +884,22 @@ static void patch_about(void)
     hook_imports((void *)real_SizeofResource, (void *)my_SizeofResource);
 }
 
+/* ---------- Cyrillic (and any non-Western) text in the editor's controls ----------
+ * The main form's DFM sets Font.Charset = ANSI_CHARSET (Western) and nearly every control inherits it,
+ * so names typed in Russian (stored in the system code page, 1251) show as "Ïðèâåò". Graphics.Charsets, the
+ * table that turns charset names from DFMs into numbers, gets ANSI_CHARSET = 1 (DEFAULT_CHARSET): fonts
+ * then use the system code page, which is still Western on a Western system. */
+#define CHARSET_ANSI_ENTRY 0x4FD6AC  /* Charsets[0]: Value 0, Name 'ANSI_CHARSET' (0x428248)              */
+#define STR_ANSI_CHARSET   0x428248
+
+static void patch_charset(void)
+{
+    DWORD *e = (DWORD *)CHARSET_ANSI_ENTRY;
+    DWORD one = DEFAULT_CHARSET;
+    if (e[0] == ANSI_CHARSET && e[1] == STR_ANSI_CHARSET && !memcmp((void *)STR_ANSI_CHARSET, "ANSI_CHARSET", 13))
+        write_mem(e, &one, 4);
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
@@ -942,6 +958,7 @@ static void apply_patches(void)
     }
 
     if (about_matches()) patch_about();
+    patch_charset();
     start_backup();
 }
 
