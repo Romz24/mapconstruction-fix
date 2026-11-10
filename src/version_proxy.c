@@ -36,6 +36,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -719,6 +720,170 @@ static void editor_exit(void)
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
+/* ---------- About window: this project, its author and links ----------
+ * Twnd_about is built from the DFM resource TWND_ABOUT. Below its text (alTop labels up to y=78) there is
+ * room until the bottom panel (y=145) for four more 13 px lines, so the window keeps its size. A copy of
+ * the DFM with four more TLabels goes into a buffer of this DLL. Windows refuses a resource whose data
+ * lies outside the image ("Resource Twnd_about not found"), so the resource stays as it is and the
+ * editor's imports of LoadResource / LockResource / SizeofResource hand out the copy for it. The two links
+ * are clickable: their OnClick names two methods added to the form's published method table (a copy with
+ * btn_clearClick plus them, the VMT points to it), which open the browser. */
+
+#define ABOUT_DATA_ENTRY  0x5A1CA0   /* IMAGE_RESOURCE_DATA_ENTRY of RCDATA TWND_ABOUT                     */
+#define ABOUT_DFM_RVA     0x1C9D94
+#define ABOUT_DFM_SIZE    22585
+#define ABOUT_INSERT_AT   0x4CB6     /* in the DFM: start of the Label6 object, after Image1               */
+#define ABOUT_VMT_METHODS 0x4D9594   /* Twnd_about VMT: vmtMethodTable                                     */
+#define ABOUT_METHODS     0x4D9747   /* its table: 1 entry, btn_clearClick                                  */
+#define ABOUT_METHODS_LEN 23
+
+#define URL_FORUM         "https://pawn.wiki/index.php?showtopic=595"
+#define URL_REPO          "https://github.com/Romz24/mapconstruction-fix"
+
+static const BYTE ABOUT_METHODS_ORIG[ABOUT_METHODS_LEN] = {
+    0x01,0x00, 0x15,0x00, 0xA0,0x97,0x4D,0x00, 0x0E,'b','t','n','_','c','l','e','a','r','C','l','i','c','k'};
+
+/* Delphi methods called as Self.Method(Sender) in eax/edx: no stack arguments, so plain cdecl fits */
+static void open_url(const char *url)
+{
+    ShellExecuteA(GetActiveWindow(), "open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+static void about_forum_click(void) { open_url(URL_FORUM); }
+static void about_repo_click(void)  { open_url(URL_REPO); }
+
+typedef struct { BYTE *p; } dfmw;
+static void dw_bytes(dfmw *w, const void *b, size_t n) { memcpy(w->p, b, n); w->p += n; }
+static void dw_ss(dfmw *w, const char *s) { size_t n = strlen(s); *w->p++ = (BYTE)n; dw_bytes(w, s, n); }
+static void dw_int(dfmw *w, const char *prop, int v)
+{
+    short s = (short)v;
+    dw_ss(w, prop); *w->p++ = 3; dw_bytes(w, &s, 2);          /* vaInt16 */
+}
+static void dw_ident(dfmw *w, const char *prop, const char *v) { dw_ss(w, prop); *w->p++ = 7; dw_ss(w, v); }
+static void dw_str(dfmw *w, const char *prop, const char *v)   { dw_ss(w, prop); *w->p++ = 6; dw_ss(w, v); }
+
+/* a centred alTop TLabel like the form's own; link: blue, underlined, hand cursor, OnClick */
+static void dw_label(dfmw *w, const char *name, int top, const char *caption, const char *onclick)
+{
+    dw_ss(w, "TLabel"); dw_ss(w, name);
+    dw_int(w, "Left", 0); dw_int(w, "Top", top); dw_int(w, "Width", 639); dw_int(w, "Height", 13);
+    if (onclick) dw_ident(w, "Cursor", "crHandPoint");
+    dw_ident(w, "Align", "alTop");
+    dw_ident(w, "Alignment", "taCenter");
+    dw_str(w, "Caption", caption);
+    if (onclick) {
+        dw_ident(w, "Font.Charset", "DEFAULT_CHARSET");
+        dw_ident(w, "Font.Color", "clBlue");
+        dw_int(w, "Font.Height", -11);
+        dw_str(w, "Font.Name", "MS Sans Serif");
+        dw_ss(w, "Font.Style"); *w->p++ = 11; dw_ss(w, "fsUnderline"); *w->p++ = 0;   /* vaSet */
+        dw_ss(w, "ParentFont"); *w->p++ = 8;                                          /* vaFalse */
+    }
+    dw_ident(w, "Layout", "tlCenter");
+    if (onclick) dw_ident(w, "OnClick", onclick);
+    *w->p++ = 0;                                              /* end of properties */
+    *w->p++ = 0;                                              /* no children */
+}
+
+static BYTE g_about_dfm[ABOUT_DFM_SIZE + 2048];
+static DWORD g_about_dfm_len;
+static BYTE g_about_methods[128];
+
+static HGLOBAL (WINAPI *real_LoadResource)(HMODULE, HRSRC);
+static LPVOID  (WINAPI *real_LockResource)(HGLOBAL);
+static DWORD   (WINAPI *real_SizeofResource)(HMODULE, HRSRC);
+
+static HGLOBAL WINAPI my_LoadResource(HMODULE mod, HRSRC res)
+{
+    if (res == (HRSRC)ABOUT_DATA_ENTRY) return (HGLOBAL)g_about_dfm;
+    return real_LoadResource(mod, res);
+}
+static LPVOID WINAPI my_LockResource(HGLOBAL h)
+{
+    if (h == (HGLOBAL)g_about_dfm) return g_about_dfm;
+    return real_LockResource(h);
+}
+static DWORD WINAPI my_SizeofResource(HMODULE mod, HRSRC res)
+{
+    if (res == (HRSRC)ABOUT_DATA_ENTRY) return g_about_dfm_len;
+    return real_SizeofResource(mod, res);
+}
+
+/* every import slot of editor.exe that holds `real` gets `hook` */
+static void hook_imports(void *real, void *hook)
+{
+    BYTE *base = (BYTE *)0x400000;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress);
+    for (; d->Name; d++) {
+        DWORD *slot = (DWORD *)(base + d->FirstThunk);
+        for (; *slot; slot++)
+            if (*slot == (DWORD)real) write_mem(slot, &hook, 4);
+    }
+}
+
+static BOOL about_matches(void)
+{
+    IMAGE_RESOURCE_DATA_ENTRY *de = (IMAGE_RESOURCE_DATA_ENTRY *)ABOUT_DATA_ENTRY;
+    const BYTE *dfm = VA(0x400000 + ABOUT_DFM_RVA);
+    return de->OffsetToData == ABOUT_DFM_RVA && de->Size == ABOUT_DFM_SIZE &&
+           !memcmp(dfm, "TPF0\x0ATwnd_about", 15) &&
+           !memcmp(dfm + ABOUT_INSERT_AT, "\x06TLabel\x06Label6", 14) &&
+           *(DWORD *)ABOUT_VMT_METHODS == ABOUT_METHODS &&
+           !memcmp(VA(ABOUT_METHODS), ABOUT_METHODS_ORIG, ABOUT_METHODS_LEN);
+}
+
+static void patch_about(void)
+{
+    const BYTE *dfm = VA(0x400000 + ABOUT_DFM_RVA);
+    dfmw w;
+    BYTE *m;
+    DWORD tbl;
+
+    w.p = g_about_dfm;
+    dw_bytes(&w, dfm, ABOUT_INSERT_AT);
+    dw_label(&w, "LabelFix0", 78, "", NULL);
+    dw_label(&w, "LabelFix1", 91, "Fixes and improvements (mapconstruction-fix): Romzes", NULL);
+    dw_label(&w, "LabelFix2", 104, URL_FORUM, "aboutForumClick");
+    dw_label(&w, "LabelFix3", 117, URL_REPO, "aboutRepoClick");
+    dw_bytes(&w, dfm + ABOUT_INSERT_AT, ABOUT_DFM_SIZE - ABOUT_INSERT_AT);
+
+    /* method table: count, then {size, code, name} - btn_clearClick as it was, then ours */
+    m = g_about_methods;
+    *(WORD *)m = 3; m += 2;
+    memcpy(m, ABOUT_METHODS_ORIG + 2, ABOUT_METHODS_LEN - 2); m += ABOUT_METHODS_LEN - 2;
+    {
+        static const char *names[2] = {"aboutForumClick", "aboutRepoClick"};
+        void *codes[2];
+        int k;
+        codes[0] = (void *)about_forum_click;
+        codes[1] = (void *)about_repo_click;
+        for (k = 0; k < 2; k++) {
+            BYTE n = (BYTE)strlen(names[k]);
+            *(WORD *)m = (WORD)(2 + 4 + 1 + n);
+            memcpy(m + 2, &codes[k], 4);
+            m[6] = n;
+            memcpy(m + 7, names[k], n);
+            m += 7 + n;
+        }
+    }
+
+    g_about_dfm_len = (DWORD)(w.p - g_about_dfm);
+    {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        real_LoadResource = (HGLOBAL (WINAPI *)(HMODULE, HRSRC))GetProcAddress(k32, "LoadResource");
+        real_LockResource = (LPVOID (WINAPI *)(HGLOBAL))GetProcAddress(k32, "LockResource");
+        real_SizeofResource = (DWORD (WINAPI *)(HMODULE, HRSRC))GetProcAddress(k32, "SizeofResource");
+        if (!real_LoadResource || !real_LockResource || !real_SizeofResource) return;
+    }
+    tbl = (DWORD)g_about_methods;
+    write_mem(VA(ABOUT_VMT_METHODS), &tbl, 4);
+    hook_imports((void *)real_LoadResource, (void *)my_LoadResource);
+    hook_imports((void *)real_LockResource, (void *)my_LockResource);
+    hook_imports((void *)real_SizeofResource, (void *)my_SizeofResource);
+}
+
 static void apply_patches(void)
 {
     static const BYTE probe_new[2] = {0x75, 0x1A};        /* jne past the error + exit    */
@@ -776,6 +941,7 @@ static void apply_patches(void)
         write_mem(VA(ADDOBJ_CALL + 1), &rel, 4);
     }
 
+    if (about_matches()) patch_about();
     start_backup();
 }
 

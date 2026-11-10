@@ -41,6 +41,8 @@
    - Файл сначала пишется в `.tmp` и потом заменяет старый, поэтому падение во время записи не портит предыдущий бэкап.
    - Карта читается в главном потоке редактора (таймер `SetTimer`), то есть никогда не в момент, когда редактор её меняет.
 
+10. **Окно About.** Под текстом авторов редактора добавлены строки «Fixes and improvements (mapconstruction-fix): Romzes» и ссылки на [тему на форуме](https://pawn.wiki/index.php?showtopic=595) и [репозиторий](https://github.com/Romz24/mapconstruction-fix). Ссылки открываются в браузере по клику. Размер окна не меняется: строки встают в пустое место над кнопкой.
+
 Перед патчем DLL сверяет байты во всех местах правки. Если это другая сборка редактора, она ничего не меняет и только пробрасывает вызовы системной `version.dll`.
 
 Поддерживаемая сборка: `editor.exe`, 1 310 720 байт, MD5 `bdde354101733b90ff2c3499dab2ddbc`.
@@ -111,6 +113,8 @@ python tools/gen_scm_ipl.py <путь к scm_objects.ipl>
 | `0x4E7E22` | `TForm1.FormClose`: `OpenProcess`/`TerminateProcess` по неинициализированному PID и `KillTask(ExtractFileName(ExeName))` (`0x4DCF10`) → вызов DLL: последний бэкап объектов, затем `TerminateProcess(GetCurrentProcess(), 0)` |
 | 6 вызовов `0x4E9982`…`0x4E99EC` | `GetFloat` (`0x4999D4`, проверяет `Count >= i` вместо `Count > i`) в `btn_camerahereClick` → заглушка: число из строки, если оно есть, иначе текущая координата точки обзора (`0x578F04`) |
 | `0x4EAA78` | `call TForm1.insertobject` в обработчике <kbd>Insert</kbd> → заглушка: вставка, только если ID в пределах `0..19999` и в таблице определений `0x57A5B8` он не `nil`, иначе предупреждение |
+| импорт `LoadResource`, `LockResource`, `SizeofResource` | для ресурса `RCDATA TWND_ABOUT` (DFM формы About, запись `0x5A1CA0`) отдают копию DFM в DLL с четырьмя дополнительными `TLabel`. Сам ресурс не трогается: Windows не находит ресурс, данные которого лежат вне образа |
+| `0x4D9594` | `vmtMethodTable` формы `Twnd_about` → копия таблицы с `btn_clearClick` и двумя методами DLL для ссылок (`aboutForumClick`, `aboutRepoClick`) |
 
 Все 17 функций системной `version.dll` пробрасываются с теми же номерами (заглушки находят адрес при первом вызове, `VerLanguageName*` переадресованы в `KERNEL32`). Это важно: драйвер видеокарты тоже использует `version.dll`. Если какой-то функции не хватает, драйвер не загружается, OpenGL откатывается на `GDI Generic`, и редактор пишет «Please install proper drivers for your graphics card».
 
