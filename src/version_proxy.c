@@ -32,6 +32,7 @@
  *  7. "Point camera at these Coords" with only "x, y" keeps the camera height instead of failing.
  *  8. <INSERT> refuses an object ID that no loaded IDE defines (it used to break every redraw).
  *  9. The placed objects are backed up to backups\objects_<session start>.pwn next to the editor.
+ * 10. UNDO after "Next"/"Prev" changed the model of an object no longer makes the object vanish.
  *
  * If the bytes at any patch site differ from the expected ones (another editor build), nothing is patched.
  */
@@ -172,6 +173,17 @@ static const DWORD g_camerahere_calls[6] = {0x4E9982, 0x4E999B, 0x4E99B4, 0x4E99
 #define FN_INSERTOBJECT   0x4EA594   /* register (Self, ID) + 3 stack args, ret 0Ch                         */
 #define IDE_BY_ID         0x57A5B8   /* array[0..19999] of the IDE definition, nil when not defined        */
 #define IDE_MAX_ID        19999
+
+/* UNDO (btn_undoClick, 0x4F2A94; Ctrl+Z) writes back the fields of an instance its record keeps, the model ID
+   (+4) among them, but not +8, the index of the loaded model the instance is drawn with. After "Next"/"Prev"
+   of the object editor changed the model, undo gave the old ID back while +8 still named the new model; the
+   drawing (0x4E11E8) skips an instance whose +8 model is not its ID, so the object vanished (an effect object
+   kept its particles, its dot was gone). When undo changes the ID, +8 becomes -1: the drawing then looks the
+   model up by its ID again (0x4E1AA7), loading it if needed. */
+#define UNDO_SET_MODEL    0x4F2BED   /* mov [edx+4],eax; lea edx,[ebp-24h] - 6 bytes                       */
+#define UNDO_SET_BACK     0x4F2BF3
+
+static const BYTE UNDO_SET_ORIG[6] = {0x89,0x42,0x04, 0x8D,0x55,0xDC};
 
 /* Particles of the effect objects (fx.cpp): the view is taken right after the scene's gluLookAt (the
    5-byte "mov eax,[slot]" before "mov eax,[eax]; call eax" loads the address of fx_look_at_slot instead),
@@ -701,6 +713,24 @@ static BYTE *build_addobj_stub(void)
     return mem;
 }
 
+static BYTE *build_undo_model_stub(void)
+{
+    static const BYTE code[18] = {
+        0x39,0x42,0x04,                                   /* cmp [edx+4],eax              */
+        0x74,0x0A,                                        /* je same                      */
+        0x89,0x42,0x04,                                   /* mov [edx+4],eax              */
+        0xC7,0x42,0x08,0xFF,0xFF,0xFF,0xFF,               /* mov dword [edx+8],-1         */
+        0x8D,0x55,0xDC};                                  /* same: lea edx,[ebp-24h]      */
+    BYTE *mem = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    emitter e;
+    if (!mem) return NULL;
+    e.p = e.base = mem;
+    e_bytes(&e, code, sizeof code);
+    e_rel(&e, 0xE9, UNDO_SET_BACK);
+    FlushInstructionCache(GetCurrentProcess(), mem, e.p - mem);
+    return mem;
+}
+
 /* ---------- backup of the placed objects ----------
  * Every BACKUP_PERIOD ms (a thread timer of the editor's main thread, so the map is never read while the
  * editor changes it) the objects the editor would export - added objects and removed buildings, the same
@@ -1104,6 +1134,15 @@ static void apply_patches(void)
     {
         DWORD rel = (DWORD)addobj - (ADDOBJ_CALL + 5);
         write_mem(VA(ADDOBJ_CALL + 1), &rel, 4);
+    }
+
+    if (!memcmp(VA(UNDO_SET_MODEL), UNDO_SET_ORIG, sizeof UNDO_SET_ORIG)) {
+        BYTE *undo = build_undo_model_stub();
+        if (undo) {
+            BYTE jmp[6] = {0xE9, 0, 0, 0, 0, 0x90};
+            *(DWORD *)(jmp + 1) = (DWORD)undo - (UNDO_SET_MODEL + 5);
+            write_mem(VA(UNDO_SET_MODEL), jmp, sizeof jmp);
+        }
     }
 
     if (about_matches()) patch_about();
